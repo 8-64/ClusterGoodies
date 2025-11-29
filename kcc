@@ -1,0 +1,476 @@
+#!/usr/bin/env perl
+
+use v5.36;
+use warnings;
+
+use Getopt::Long qw(GetOptionsFromArray);
+use JSON::PP qw(decode_json);
+use Scalar::Util qw(looks_like_number);
+
+# ------------------------------------------------------------
+# Configuration / defaults
+# ------------------------------------------------------------
+
+my $DEFAULT_ALIAS_TEMPLATE = 'eks/%CLUSTER%@%ACCOUNT%/%REGION%';
+
+# ------------------------------------------------------------
+# CLI parsing
+# ------------------------------------------------------------
+
+my %opt = (
+    verbose => 0,
+    dry_run => 0,
+);
+
+GetOptionsFromArray(
+    \@ARGV,
+    'region=s'  => \$opt{region},    # override AWS region
+    'cluster=s' => \$opt{cluster},   # desired EKS cluster name
+    'profile=s' => \$opt{profile},   # AWS profile
+    'verbose+'  => \$opt{verbose},   # -v, -vv, ...
+    'dry-run'   => \$opt{dry_run},   # just show what would be done
+    'help'      => \$opt{help},
+) or die "Error parsing options. Use --help\n";
+
+if ($opt{help}) {
+    print_help();
+    exit 0;
+}
+
+# ------------------------------------------------------------
+# Main
+# ------------------------------------------------------------
+
+sub main () {
+    my $region      = detect_region($opt{region});
+    my $account_id  = detect_account_id($opt{profile});
+    my $clusters    = list_eks_clusters($region, $opt{profile});
+
+    if (!@$clusters) {
+        die "No EKS clusters found in region '$region' for account '$account_id'.\n";
+    }
+
+    my $target_cluster = select_target_cluster($clusters, $opt{cluster});
+
+    my $alias_template = $ENV{KCC_ALIAS_TEMPLATE} // $DEFAULT_ALIAS_TEMPLATE;
+    my $target_context_alias
+        = build_context_alias($alias_template, $target_cluster, $account_id, $region);
+
+    log_info("AWS account : $account_id");
+    log_info("AWS region  : $region");
+    log_info("EKS cluster : $target_cluster");
+    log_info("Context alias: $target_context_alias");
+
+    my $kube_config = get_kubeconfig_json();
+
+    my $current_context = get_current_context_name($kube_config);
+    my $current_cluster = $current_context
+        ? get_cluster_name_for_context($kube_config, $current_context)
+        : undef;
+
+    if ($current_context) {
+        log_info("Current context: $current_context");
+        log_info("Current cluster: " . ($current_cluster // '(unknown)'));
+    } else {
+        log_info("No current kubectl context set.");
+    }
+
+    # If we are already on the right cluster, we can exit early.
+    if (defined $current_cluster && $current_cluster eq $target_cluster) {
+        log_info("Already using EKS cluster '$target_cluster' (no action needed).");
+        return 0;
+    }
+
+    # Try to find an existing context for the target cluster
+    my $existing_context = find_context_for_cluster(
+        $kube_config,
+        cluster_name => $target_cluster,
+        alias        => $target_context_alias,
+    );
+
+    if ($existing_context) {
+        if ($current_context && $current_context eq $existing_context) {
+            log_info("Already using context '$existing_context' (no action needed).");
+            return 0;
+        }
+
+        log_info("Found existing context '$existing_context' for cluster '$target_cluster'.");
+        switch_kubectl_context($existing_context);
+        return 0;
+    }
+
+    # No existing context – create one via aws eks update-kubeconfig
+    log_info("No existing kubectl context for cluster '$target_cluster'.");
+    log_info("Creating kubeconfig entry via aws eks update-kubeconfig...");
+
+    create_kubeconfig_for_cluster(
+        cluster_name => $target_cluster,
+        region       => $region,
+        profile      => $opt{profile},
+        alias        => $target_context_alias,
+    );
+
+    # Reload kubeconfig after modification
+    $kube_config = get_kubeconfig_json();
+
+    my $new_context = find_context_for_cluster(
+        $kube_config,
+        cluster_name => $target_cluster,
+        alias        => $target_context_alias,
+    ) // $target_context_alias;
+
+    log_info("Switching kubectl context to '$new_context'.");
+    switch_kubectl_context($new_context);
+
+    return 0;
+}
+
+exit main();
+
+# ------------------------------------------------------------
+# Detection helpers
+# ------------------------------------------------------------
+
+sub normalize_region ($raw) {
+    return undef unless defined $raw;
+
+    # Trim whitespace
+    $raw =~ s/^\s+//;
+    $raw =~ s/\s+$//;
+
+    # Strip wrapping single/double quotes: 'eu-central-1' or "eu-central-1"
+    if ($raw =~ /^['"](.*)['"]$/) {
+        $raw = $1;
+    }
+
+    # If something like "region eu-central-1" ever appears, grab the real region
+    if ($raw =~ /([a-z]{2}-[a-z0-9-]+-\d)/) {
+        $raw = $1;
+    }
+
+    return $raw;
+}
+
+sub detect_region ($override_region) {
+    if (defined $override_region && length $override_region) {
+        my $norm = normalize_region($override_region);
+        log_debug("Using region from --region: $norm");
+        return $norm;
+    }
+
+    if (my $env_region = $ENV{AWS_REGION} // $ENV{AWS_DEFAULT_REGION}) {
+        my $norm = normalize_region($env_region);
+        log_debug("Using region from environment: $env_region -> $norm");
+        return $norm;
+    }
+
+    my ($out, $exit) = run_cmd_capture(qw/aws configure get region/);
+    chomp $out;
+    if ($exit == 0 && $out) {
+        my $norm = normalize_region($out);
+        log_debug("Using region from 'aws configure get region': $out -> $norm");
+        return $norm;
+    }
+
+    die "Unable to determine AWS region. Set AWS_REGION, AWS_DEFAULT_REGION, or use --region.\n";
+}
+
+sub detect_account_id ($profile) {
+    my @cmd = (qw/aws sts get-caller-identity --output json/);
+    push @cmd, ('--profile', $profile) if defined $profile;
+
+    my ($out, $exit) = run_cmd_capture(@cmd);
+    if ($exit != 0) {
+        die "Failed to run '@cmd' (exit $exit). Is AWS CLI configured?\n";
+    }
+
+    my $json = decode_json_safely($out, "STS get-caller-identity");
+    my $account = $json->{Account}
+        or die "AWS STS get-caller-identity did not return an Account field.\n";
+
+    unless (looks_like_number($account)) {
+        die "STS get-caller-identity returned non-numeric account: $account\n";
+    }
+
+    return $account;
+}
+
+sub list_eks_clusters ($region, $profile) {
+    my @cmd = (qw/aws eks list-clusters --output json --region/, $region);
+    push @cmd, ('--profile', $profile) if defined $profile;
+
+    my ($out, $exit) = run_cmd_capture(@cmd);
+    if ($exit != 0) {
+        die "Failed to run '@cmd' (exit $exit). Is EKS allowed for this account/region?\n";
+    }
+
+    my $json = decode_json_safely($out, "EKS list-clusters");
+    my $clusters = $json->{clusters} // [];
+
+    log_debug("EKS clusters in region '$region': " . join(', ', @$clusters)) if @$clusters;
+
+    return $clusters;
+}
+
+sub select_target_cluster ($clusters, $requested_cluster) {
+    my @sorted = sort @$clusters;
+
+    if (defined $requested_cluster && length $requested_cluster) {
+        my %set = map { $_ => 1 } @$clusters;
+        if ($set{$requested_cluster}) {
+            return $requested_cluster;
+        }
+        die "Requested cluster '$requested_cluster' not found in EKS list.\n";
+    }
+
+    # If there is only one cluster, use it.
+    if (@sorted == 1) {
+        log_info("Only one EKS cluster found; selecting '$sorted[0]'.");
+        return $sorted[0];
+    }
+
+    # If multiple clusters, prefer first alphabetically unless user sets KCC_DEFAULT_CLUSTER
+    if (my $default = $ENV{KCC_DEFAULT_CLUSTER}) {
+        my %set = map { $_ => 1 } @$clusters;
+        if ($set{$default}) {
+            log_info("Selecting default cluster from KCC_DEFAULT_CLUSTER: '$default'.");
+            return $default;
+        } else {
+            log_info("KCC_DEFAULT_CLUSTER='$default' not found; falling back to alphabetic first.");
+        }
+    }
+
+    log_info("Multiple EKS clusters found: " . join(', ', @sorted));
+    log_info("No cluster specified; selecting alphabetically first: '$sorted[0]'.");
+    return $sorted[0];
+}
+
+sub build_context_alias ($template, $cluster, $account, $region) {
+    my $alias = $template;
+    $alias =~ s/%CLUSTER%/$cluster/g;
+    $alias =~ s/%ACCOUNT%/$account/g;
+    $alias =~ s/%REGION%/$region/g;
+    return $alias;
+}
+
+# ------------------------------------------------------------
+# Kubeconfig helpers
+# ------------------------------------------------------------
+
+sub get_kubeconfig_json () {
+    my (@cmd) = qw/kubectl config view -o json/;
+    my ($out, $exit) = run_cmd_capture(@cmd);
+
+    if ($exit != 0) {
+        # No kubeconfig, or kubectl not configured yet
+        log_debug("kubectl config view failed (exit $exit); treating as empty kubeconfig.");
+        return {
+            contexts => [],
+            clusters => [],
+        };
+    }
+
+    return decode_json_safely($out, "kubectl config view");
+}
+
+sub get_current_context_name ($kube) {
+    my @contexts = @{ $kube->{contexts} // [] };
+    # Try via "kubectl config current-context" first, as it's canonical
+    my ($out, $exit) = run_cmd_capture(qw/kubectl config current-context/);
+    if ($exit != 0) {
+        return undef;
+    }
+    chomp $out;
+    return $out if $out;
+
+    # Fallback: if only one context, use that
+    if (@contexts == 1) {
+        return $contexts[0]{name};
+    }
+
+    return undef;
+}
+
+sub get_cluster_name_for_context ($kube, $context_name) {
+    my @contexts = @{ $kube->{contexts} // [] };
+    my ($ctx) = grep { $_->{name} // '' eq $context_name } @contexts;
+    return undef unless $ctx;
+
+    my $cluster_ref_name = $ctx->{context}{cluster};
+    return undef unless $cluster_ref_name;
+
+    # cluster_ref_name may be an ARN (arn:aws:eks:region:acct:cluster/NAME)
+    # or just a simple cluster name.
+    my $name = $cluster_ref_name;
+    if ($name =~ m{/}) {
+        $name = (split m{/}, $name)[-1];
+    }
+    return $name;
+}
+
+sub find_context_for_cluster ($kube, %args) {
+    my $target_cluster = $args{cluster_name};
+    my $alias          = $args{alias};
+
+    my @contexts = @{ $kube->{contexts} // [] };
+
+    # First, prefer exact alias match if present
+    if (defined $alias) {
+        for my $ctx (@contexts) {
+            next unless defined $ctx->{name};
+            return $ctx->{name} if $ctx->{name} eq $alias;
+        }
+    }
+
+    # Otherwise, look for a context whose cluster name maps to the target cluster
+    for my $ctx (@contexts) {
+        my $ctx_name = $ctx->{name} // next;
+        my $cluster_ref = $ctx->{context}{cluster} // next;
+
+        my $name = $cluster_ref;
+        $name = (split m{/}, $name)[-1] if $name =~ m{/};
+
+        if ($name eq $target_cluster) {
+            return $ctx_name;
+        }
+    }
+
+    return undef;
+}
+
+sub create_kubeconfig_for_cluster (%args) {
+    my $cluster = $args{cluster_name};
+    my $region  = $args{region};
+    my $profile = $args{profile};
+    my $alias   = $args{alias};
+
+    my @cmd = (qw/aws eks update-kubeconfig --name/, $cluster, '--region', $region);
+    push @cmd, ('--profile', $profile) if defined $profile;
+    push @cmd, ('--alias',   $alias)   if defined $alias && length $alias;
+
+    log_info("Running: " . join(' ', @cmd));
+
+    if ($opt{dry_run}) {
+        log_info("[dry-run] Skipping aws eks update-kubeconfig.");
+        return;
+    }
+
+    my ($out, $exit) = run_cmd_capture(@cmd);
+    if ($exit != 0) {
+        die "Failed to run '@cmd' (exit $exit).\nOutput:\n$out\n";
+    }
+
+    chomp $out;
+    log_info($out) if $out;
+}
+
+sub switch_kubectl_context ($context_name) {
+    my @cmd = (qw/kubectl config use-context/, $context_name);
+
+    log_info("Running: " . join(' ', @cmd));
+    if ($opt{dry_run}) {
+        log_info("[dry-run] Skipping kubectl config use-context.");
+        return;
+    }
+
+    my ($out, $exit) = run_cmd_capture(@cmd);
+    if ($exit != 0) {
+        die "Failed to run '@cmd' (exit $exit).\nOutput:\n$out\n";
+    }
+
+    chomp $out;
+    log_info($out) if $out;
+}
+
+# ------------------------------------------------------------
+# Utility helpers
+# ------------------------------------------------------------
+
+sub run_cmd_capture (@cmd) {
+    my $cmd_str = join(' ', @cmd);
+    log_debug("Executing: $cmd_str");
+
+    open my $fh, '-|', @cmd
+        or die "Failed to spawn command '$cmd_str': $!";
+
+    my $output = do { local $/; <$fh> // '' };
+
+    close $fh;
+    my $exit_code = $? >> 8;
+
+    log_debug("Command exit code: $exit_code");
+    log_debug("Command output:\n$output") if $opt{verbose} >= 2;
+
+    return ($output, $exit_code);
+}
+
+sub decode_json_safely ($text, $context) {
+    my $json;
+    eval { $json = decode_json($text); 1 }
+        or die "Failed to parse JSON from $context: $@\nRaw content:\n$text\n";
+    return $json;
+}
+
+sub log_info ($msg) {
+    say "[INFO]  $msg";
+}
+
+sub log_debug ($msg) {
+    return unless $opt{verbose};
+    say "[DEBUG] $msg";
+}
+
+sub print_help () {
+    say <<'USAGE';
+kcc.pl - Kubernetes Current Context switcher (AWS EKS-aware)
+
+Usage:
+  kcc.pl [options]
+
+Options:
+  --region <region>     AWS region to use (overrides AWS_REGION/AWS_DEFAULT_REGION).
+  --cluster <name>      EKS cluster name to target.
+  --profile <name>      AWS CLI profile to use.
+  --verbose             Increase verbosity (-v, -vv, ...).
+  --dry-run             Show commands but do not execute changes.
+  --help                Show this help.
+
+Environment:
+  AWS_REGION / AWS_DEFAULT_REGION
+      Used to determine region if --region is not given.
+
+  AWS_PROFILE
+      Used by AWS CLI if --profile is not given.
+
+  KCC_DEFAULT_CLUSTER
+      Preferred EKS cluster name if multiple clusters exist and --cluster is
+      not provided.
+
+  KCC_ALIAS_TEMPLATE
+      Template for kubectl context alias. Default:
+        eks/%CLUSTER%@%ACCOUNT%/%REGION%
+      Placeholders:
+        %CLUSTER%  - EKS cluster name
+        %ACCOUNT%  - AWS account ID
+        %REGION%   - AWS region
+
+Behaviour:
+  - Detects current AWS account (via `aws sts get-caller-identity`).
+  - Determines region (via --region, env, or `aws configure get region`).
+  - Lists EKS clusters in that account/region.
+  - Chooses a target cluster.
+  - Checks current kubectl context and underlying cluster.
+  - If already on the target cluster, does nothing.
+  - If a context for the target cluster already exists, switches to it.
+  - Otherwise, runs `aws eks update-kubeconfig` (with a deterministic alias),
+    then switches kubectl to that new context.
+
+Requirements:
+  - perl >= 5.36
+  - aws CLI installed and configured
+  - kubectl installed
+
+USAGE
+}
+
+__END__
