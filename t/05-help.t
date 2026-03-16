@@ -3,7 +3,6 @@
 use v5.36;
 use warnings;
 use Test::More;
-use Test::Output;
 
 # Test help output
 my $help_output = <<'HELP';
