@@ -292,6 +292,11 @@ sub get_current_context_name ($kube) {
 }
 
 sub get_cluster_name_for_context ($kube, $context_name) {
+    # If the context name is an EKS ARN, extract the cluster name from it
+    if ($context_name =~ m{arn:aws:eks:[^:]+:[^:]+:cluster/(.+)}) {
+        return $1;
+    }
+
     my @contexts = @{ $kube->{contexts} // [] };
     my ($ctx) = grep { $_->{name} // '' eq $context_name } @contexts;
     return undef unless $ctx;
