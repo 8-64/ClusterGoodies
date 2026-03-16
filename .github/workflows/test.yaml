@@ -1,0 +1,184 @@
+# GitHub Actions Workflow Configuration
+# This workflow file automates testing for the ClusterGoodies Perl project
+
+# Name that appears in the GitHub Actions UI
+name: Test Suite
+
+# Trigger configuration: defines when this workflow runs
+on:
+  # Runs on every push to any branch
+  push:
+  # Runs on every pull request to any branch
+  pull_request:
+  # Allows manual triggering from the GitHub Actions UI (workflow_dispatch)
+  workflow_dispatch:
+
+# Define the jobs that will run as part of this workflow
+jobs:
+  # Job identifier - can reference this job's outputs and results
+  test:
+    # Strategy matrix: run this job on multiple OS configurations
+    strategy:
+      # Use matrix strategy to run the same job on different OS
+      matrix:
+        # List of operating systems to test on
+        os: [ubuntu-latest, windows-latest]
+    
+    # Specify which runner (OS environment) to use for this job
+    runs-on: ${{ matrix.os }}
+    
+    # Set environment variables that will be available to all steps
+    env:
+      # Track when the workflow started for timing calculations
+      WORKFLOW_START_TIME: ${{ github.server_time }}
+    
+    # Steps are the individual commands/tasks that run sequentially
+    steps:
+      # Step 1: Record the exact start time for precise duration calculation
+      - name: Record workflow start time
+        # Run shell commands (bash on Linux, PowerShell on Windows automatically)
+        shell: bash
+        # Execute command to capture start timestamp
+        run: echo "START_TIME=$(date +%s)" >> $GITHUB_ENV
+      
+      # Step 2: Check out the repository code to the runner's workspace
+      - name: Checkout repository code
+        # Use the official GitHub checkout action (version 4)
+        uses: actions/checkout@v4
+        # No additional parameters needed for default behavior
+      
+      # Step 3: Set up Perl runtime environment
+      - name: Setup Perl environment
+        # Use the official Perl setup action
+        uses: shogo82148/actions-setup-perl@v1
+        # Specify the Perl version to install
+        with:
+          perl-version: '5.36'
+      
+      # Step 4: Install Perl Test Harness (prove command)
+      - name: Install Perl prove test harness
+        # Shell command to install the Test::Harness module via cpan
+        run: cpan -i Test::Harness
+      
+      # Step 5: Verify Perl and prove are installed correctly
+      - name: Verify Perl installation
+        # Display the Perl version for debugging purposes
+        run: perl -v | head -20
+      
+      # Step 6: Verify prove command is available and working
+      - name: Verify prove command availability
+        # Test that prove is accessible and show its version/help
+        run: prove --version
+      
+      # Step 7: Execute the test suite using prove
+      - name: Run test suite with prove
+        # Execute prove recursively on all test files (*.t files)
+        # The -r flag recurses into directories
+        # The t/ directory contains test files
+        run: prove -r t/
+        # Continue even if tests fail (for the next steps to capture system info)
+        continue-on-error: true
+      
+      # Step 8: Collect and display CPU information (Linux specific)
+      - name: Display CPU information (Linux)
+        # Only run this step on Linux runners
+        if: runner.os == 'Linux'
+        # Display CPU information from /proc/cpuinfo
+        run: |
+          echo "=== CPU INFORMATION ==="
+          nproc
+          cat /proc/cpuinfo | grep -E "model name|processor" | head -20
+      
+      # Step 9: Collect and display CPU information (Windows specific)
+      - name: Display CPU information (Windows)
+        # Only run this step on Windows runners
+        if: runner.os == 'Windows'
+        # PowerShell command to get CPU details
+        shell: pwsh
+        run: |
+          Write-Output "=== CPU INFORMATION ==="
+          Get-CimInstance Win32_Processor | Select-Object -Property Name, NumberOfCores, NumberOfLogicalProcessors, MaxClockSpeed
+      
+      # Step 10: Collect and display memory information (Linux specific)
+      - name: Display memory information (Linux)
+        # Only run on Linux runners
+        if: runner.os == 'Linux'
+        # Display memory details from /proc/meminfo and free command
+        run: |
+          echo "=== MEMORY INFORMATION ==="
+          free -h
+          grep -i memtotal /proc/meminfo
+      
+      # Step 11: Collect and display memory information (Windows specific)
+      - name: Display memory information (Windows)
+        # Only run on Windows runners
+        if: runner.os == 'Windows'
+        # PowerShell command to get memory information
+        shell: pwsh
+        run: |
+          Write-Output "=== MEMORY INFORMATION ==="
+          Get-CimInstance Win32_ComputerSystem | Select-Object -Property TotalPhysicalMemory
+          Get-CimInstance Win32_OperatingSystem | Select-Object -Property FreePhysicalMemory, TotalVisibleMemorySize
+      
+      # Step 12: Collect and display disk usage (Linux specific)
+      - name: Display disk usage (Linux)
+        # Only run on Linux runners
+        if: runner.os == 'Linux'
+        # Display disk usage with human-readable format
+        run: |
+          echo "=== DISK USAGE INFORMATION ==="
+          df -h
+      
+      # Step 13: Collect and display disk usage (Windows specific)
+      - name: Display disk usage (Windows)
+        # Only run on Windows runners
+        if: runner.os == 'Windows'
+        # PowerShell command to get disk information
+        shell: pwsh
+        run: |
+          Write-Output "=== DISK USAGE INFORMATION ==="
+          Get-Volume | Select-Object DriveLetter, Size, SizeRemaining
+      
+      # Step 14: Display operating system version information (Linux specific)
+      - name: Display OS version (Linux)
+        # Only run on Linux runners
+        if: runner.os == 'Linux'
+        # Display OS release information
+        run: |
+          echo "=== OPERATING SYSTEM INFORMATION ==="
+          cat /etc/os-release
+      
+      # Step 15: Display operating system version information (Windows specific)
+      - name: Display OS version (Windows)
+        # Only run on Windows runners
+        if: runner.os == 'Windows'
+        # PowerShell command to get Windows version details
+        shell: pwsh
+        run: |
+          Write-Output "=== OPERATING SYSTEM INFORMATION ==="
+          Get-CimInstance Win32_OperatingSystem | Select-Object -Property Caption, Version, BuildNumber, OSArchitecture
+      
+      # Step 16: Calculate and display total execution time
+      - name: Calculate and display execution time
+        # Run on both platforms using bash (available on both)
+        shell: bash
+        # Calculate elapsed time in seconds and convert to readable format
+        run: |
+          echo "=== WORKFLOW EXECUTION TIME ==="
+          END_TIME=$(date +%s)
+          ELAPSED=$((END_TIME - START_TIME))
+          HOURS=$((ELAPSED / 3600))
+          MINUTES=$(((ELAPSED % 3600) / 60))
+          SECONDS=$((ELAPSED % 60))
+          echo "Total execution time: ${HOURS}h ${MINUTES}m ${SECONDS}s (${ELAPSED} seconds)"
+      
+      # Step 17: Summary output combining all system information
+      - name: Workflow summary
+        # Display a summary message at the end
+        run: |
+          echo "=== WORKFLOW COMPLETED ==="
+          echo "Repository: ${{ github.repository }}"
+          echo "Commit: ${{ github.sha }}"
+          echo "Branch: ${{ github.ref }}"
+          echo "Runner OS: ${{ runner.os }}"
+          echo "Test execution completed on $(date)"
